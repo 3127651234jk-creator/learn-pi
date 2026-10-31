@@ -61,6 +61,8 @@ sequenceDiagram
 
 ```
 python/
+  docs/
+    storage-entities.md 一次存储涉及哪些实体:五张表、状态机与事务时间线详解
   pidurable/            迷你版库(对应 @earendil-works 的三个包)
     storage.py          SQLite 存储:条目/文档/任务/提交/事件,全部原子提交
     tools.py            工具注册表 + bash 工具 + 重放策略(replay policy)
