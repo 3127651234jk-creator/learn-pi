@@ -226,6 +226,10 @@ result_text = tool.run(arguments)
 
 以第 2/3 课的输入 `!sleep 4 && echo FINISHED`(带 `request_id="crash-demo-1"`,一条 bash 工具调用)为例。**每个编号 = 一个事务**,对照 `harness.py`:
 
+![一次完整运行的事务时序图:客户端递交 submit(requestId) 后,Harness 与 SQLite 之间依次发生 T1–T8 原子提交,模型调用与工具执行夹在事务之间](transaction-timeline.png)
+
+(图中省略了 T7 —— 它只在有 steer 并入时发生,见下表第 7 行。)
+
 | # | 事务(代码位置) | 写入的实体 |
 |---|---|---|
 | T1 | `submit()` | `submissions`:新行(open, request_id=crash-demo-1, mode=input);`entries`:`pi.user`;`events`:`submission_created` |

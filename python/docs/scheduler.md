@@ -247,7 +247,7 @@ _drain_inbox()        ← 工具轮次结束,运行途中到达的 steer 此时�
 
 ### A1 主线:一次"生成 → 工具 → 生成"的完整运行
 
-事务编号 T1–T8 对应 [storage-entities.md](storage-entities.md) 第 3 节;两个灰色注记"不在任何事务里"的就是仅有的两处外部动作。崩溃分支(死在两个外部动作处会发生什么)见 [python/README.md](../README.md) 的崩溃-续跑时序图。
+事务编号 T1–T8 对应 [storage-entities.md](storage-entities.md) 第 3 节(该节顶部附有这组事务的渲染时序图 `transaction-timeline.png`,可先看图再读下面的细粒度版本);两个灰色注记"不在任何事务里"的就是仅有的两处外部动作。崩溃分支(死在两个外部动作处会发生什么)见 [python/README.md](../README.md) 的崩溃-续跑时序图。
 
 ```mermaid
 sequenceDiagram
