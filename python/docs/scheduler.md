@@ -329,7 +329,8 @@ sequenceDiagram
 
     rect rgb(255, 247, 235)
     Note over U,S: 情形 3:agent 空闲 —— 无人消费,调度器兜底升级
-    U->>S: 同 T1s,进 inbox;kick()
+    U->>S: 同 T1s,进 inbox
+    U->>W: kick()(调度器空闲,没有活可领)
     W->>S: _step 分支 3(_promote_oldest_steer):inbox 弹出 + pi.user 落库 + mode 改为 input(状态保持 open)
     W->>S: 下一轮 _step 像普通输入一样领取:open→running + 插入 pi.generation
     Note over W: steer 从此获得完整生命周期,最终同样 done
