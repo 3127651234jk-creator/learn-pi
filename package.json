@@ -1,0 +1,25 @@
+{
+  "name": "pi-durable-hello",
+  "private": true,
+  "type": "module",
+  "description": "The smallest possible tour of pi-durable: a durable agent that survives a crash.",
+  "scripts": {
+    "hello": "tsx src/01-hello.ts",
+    "crash": "tsx src/02-crash.ts",
+    "resume": "tsx src/03-resume.ts",
+    "twice": "tsx src/04-idempotent.ts",
+    "watch": "tsx src/05-watch.ts",
+    "clean": "rm -rf .data"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.3",
+    "@earendil-works/pi-ai": "1.0.3",
+    "@earendil-works/pi-durable": "1.0.3",
+    "tsx": "^4.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "5.9.3"
+  },
+  "engines": { "node": ">=22.19.0" }
+}
