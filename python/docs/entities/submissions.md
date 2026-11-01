@@ -118,7 +118,7 @@ with harness.storage.commit() as st:
 
 ## 9. 与 TS 原版对应
 
-对应 `@earendil-works/pi-durable` 的 submissions 表(原版还有 sessions 等,迷你版只保留 root 会话,所以没有 session 列)。
+对应 `@earendil-works/pi-durable` 的 submissions 表。原版的会话实体是 `conversations` 表(见 [conversations.md](conversations.md)),迷你版只保留一条隐式 root 会话,所以没有这张表;submissions 行也没有 session/conversation 列。
 
 ---
 

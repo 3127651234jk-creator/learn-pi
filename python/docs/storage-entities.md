@@ -328,11 +328,22 @@ harness.resume()   # storage.finalize_finished_submissions() + kick()
 | 本库实体 | TS 原版对应 |
 |---|---|
 | `entries` | `storage/sqlite` 的 entries 表 |
-| `submissions` | submissions 表(原版还有 sessions 等,迷你版只保留 root 会话) |
+| `submissions` | submissions 表(原版的会话实体是 conversations 表,见 [entities/conversations.md](entities/conversations.md);迷你版只保留 root 会话) |
 | `tasks` | tasks 表 |
-| `events` | events 表 |
+| `events` | TS 原版**没有** events 表;观察者语义由 `subscribeCommits()` publication + `watchEvents()` 承担(见 [entities/events.md](entities/events.md) 第 8 节) |
 | `documents.inbox` | steer 收件箱语义 |
 | `documents.pi.system-state` | 系统提示词去重语义(当前实现只记录、不注入模型请求) |
+
+TS 原版的 SQLite 存储一共 9 张表,比迷你版多出的 4 张各有一篇详解:
+
+| TS 原版表 | 作用 | 详解 |
+|---|---|---|
+| `durable_schema` | schema 版本号,迁移机制的地基 | [entities/durable_schema.md](entities/durable_schema.md) |
+| `durable_metadata` | 全局 ID 游标 `next_id` + 提交序号 `next_seq` | [entities/durable_metadata.md](entities/durable_metadata.md) |
+| `record_ids` | 全局 ID 空间的类型归属登记 | [entities/record_ids.md](entities/record_ids.md) |
+| `conversations` | 会话实体:root / fork 分支 / 任务子会话 | [entities/conversations.md](entities/conversations.md) |
+| `entries` / `tasks` / `submissions` / `documents` | 迷你版四张表的对应物 | 各 entities 文档 |
+| `document_revisions` | 文档内容的 base/delta 版本链 | [entities/document_revisions.md](entities/document_revisions.md) |
 
 ### 没有被持久化的东西
 

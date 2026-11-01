@@ -87,7 +87,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 ## 8. 与 TS 原版对应
 
-对应 `@earendil-works/pi-durable` 的 events 表与 `watchEvents()` API。
+**TS 原版没有 events 表**。观察者语义由两层承担:`Session.subscribeCommits()`(`session/session.ts:384`)在每个提交采纳后同步发出内存中的 `CommitPublication`;Harness 的 `watchEvents()`(`harness/events.ts:140`)把某个会话的已提交 publication 翻译成 agent 事件流,重连时重新取快照再听增量。
+
+迷你版把事件**持久化成表**,换来的是观察者可以跨进程、跨重启用 `events_since(游标)` 增量消费,游标本身就是数据库里的行号。这是迷你实现自己的选择,不是对原版某张表的对应。
 
 ---
 
