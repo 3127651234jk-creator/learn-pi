@@ -12,7 +12,7 @@
 - **调度线程**:后台单线程 `pi-scheduler`,不断从库里挑待办任务来执行;
 - **唤醒机制**:`threading.Condition` 充当"闹钟",`kick()` 立刻叫醒;没叫醒也有 0.2 秒轮询兜底。
 
-调度器的**全部决策依据都在数据库里**:`next_submission_needing_work()` 挑活、`next_open_task()` 推进、`open_steers()` 兜底。内存里唯一的调度状态是 `self._active`(正在推进的 submission id)和 `_wake`/`_closed` 两个控制量 —— 它们都可以随时丢弃重建,这正是"进程可随时被杀"在调度侧的体现。
+调度器的**全部决策依据都在数据库里**:`next_submission_needing_work()` 挑活、`next_open_task()` 推进、`_promote_oldest_steer()`(`harness.py:509-518`)通过 `get_doc("inbox", [])`(`harness.py:510`)做空闲兜底。(`open_steers()`(`storage.py:175-179`)不参与调度,只被 `wait_for_idle()` 使用。)内存里唯一的调度状态是 `self._active`(正在推进的 submission id)和 `_wake`/`_closed` 两个控制量 —— 它们都可以随时丢弃重建,这正是"进程可随时被杀"在调度侧的体现。
 
 它**不是**的:不是多线程执行器(agent 工作天然串行,不做并行);不是事件循环(事件只是观察协议,见 [events.md](entities/events.md));不持有任何业务状态(一切以表为准)。
 
@@ -35,7 +35,7 @@
 
 ### 2.3 为什么调度线程是 daemon?
 
-`harness.py:257-259`:主进程退出时调度线程跟着死,这没关系 —— 所有进度已落库,下个进程 `resume()` 就能接手。调度器自己也是"可丢弃的",这是整个体系纪律的一部分。
+`harness.py:257-259`:主进程退出时调度线程跟着死,这没关系 —— 所有进度已落库,下个进程 `open()` 启动调度线程就能接手未完成任务;若还需要补收"任务都 done、submission 仍 running"的收尾,再调 `resume()`。调度器自己也是"可丢弃的",这是整个体系纪律的一部分。
 
 ## 3. 主循环 `_loop`(`harness.py:334`)
 
@@ -122,12 +122,13 @@ flowchart TD
 一次 input 的推进由此被切成一串任务,每个 `_step` 恰好执行一个:
 
 ```
-pi.generation  →  pi.tool × n  →  pi.generation  →  ...  →  队列空,收尾
+pi.generation  →  pi.tool × n  →  pi.generation × n  →  ...  →  队列空,收尾
 ```
 
 - generation 完成 → 回答里每个工具调用各生成一个 `pi.tool` 任务(先记账,后执行);
 - tool 完成 → 结果落库,插一个新的 `pi.generation`,让模型带着结果继续;
-- 直到某次回复不再要求调工具,队列清空,submission 宣告 done。
+- 一批 n 个工具就会插 n 个 generation;由于它们 id 更大,会等 n 个工具都跑完再依次执行(见第 10 节第 8 条);
+- 直到所有已排队的 generation 都执行完且都不再要求调工具,队列清空,submission 宣告 done。
 
 ## 6. 两大执行器:"原子提交夹外部动作"的三明治结构
 
@@ -147,6 +148,17 @@ models.generate(...)  ← 唯一的"外部世界"动作;死在这里,重启后�
 
 "回答落库 + 派生工具任务 + 任务完成"三件事同事务落盘 —— 不会出现"回复有了但任务没记上"的中间态。
 
+首次运行(或系统提示词/工具列表变化)时,两次提交之间还会多一次独立提交:`_ensure_system_entry()` 写入空的 `pi.system` 条目和 `pi.system-state` 文档。它不在 T3 的事务里,也不发事件。代码依据:
+
+```python
+# harness.py:420-424
+with self.storage.commit() as st:
+    st.update_task(task["id"], status="running", checkpoint={"phase": "calling-model"})
+    st.emit("turn_start", {"submissionId": sid})
+self._ensure_system_entry()  # 独立事务(T3b),仅在状态变化时写入
+reply = self.models.generate(self.model_ref, self._messages(), self.registry.specs())
+```
+
 ### 6.2 `_run_tool`(`harness.py:434`)—— 崩溃恢复学问最大的一段
 
 入口先看任务此刻的 `status`:
@@ -162,13 +174,14 @@ models.generate(...)  ← 唯一的"外部世界"动作;死在这里,重启后�
 ```
 提交 1(事前检查点)   tasks: running + checkpoint={"phase":"executing"};events: tool_execution_update
    ↓
-tool.run(arguments)   ← 死在这里就是第 2 课 02_crash.py 的场景(os._exit(1))
+tool.run(call.get("arguments", {}))
+                      ← 死在这里就是第 2 课 02_crash.py 的场景(os._exit(1))
    ↓                     (工具抛异常不炸调度器:错误文本当作结果交给模型)
 提交 2(收尾)         entries: pi.tool-result(带 toolCallId);
                       tasks: tool→done + 插入下一轮 pi.generation;
                       events: tool_result
    ↓
-_drain_inbox()        ← 工具轮次结束,运行途中到达的 steer 此时并入
+_drain_inbox()        ← 每个 pi.tool 任务收尾后都会调用;运行途中到达的 steer 此时并入
 ```
 
 ## 7. 收尾与 steer 的三个消费点
@@ -176,35 +189,48 @@ _drain_inbox()        ← 工具轮次结束,运行途中到达的 steer 此时�
 | 代码 | 时机 | 动作 |
 |---|---|---|
 | `_finish()`(`harness.py:398`) | 任务队列空 | 先 `_drain_inbox()` 兜底;事务:submission → done + `submission_done` 事件;清空 `_active` |
-| `_drain_inbox()`(`harness.py:482`) | 每轮工具结束后、收尾前 | 循环到收件箱空;**每条 steer 单独一个事务**:弹出 inbox + 写 `pi.user` 条目 + 该 steer 的 submission 标记 done。运行途中陆续到达的 steer 一个不漏 |
+| `_drain_inbox()`(`harness.py:482`) | 每个 `pi.tool` 任务收尾后、`_finish()` 开头 | 循环到收件箱空;**每条 steer 单独一个事务**:弹出 inbox + 写 `pi.user` 条目 + 该 steer 的 submission 标记 done。运行途中陆续到达的 steer 一个不漏。有 n 个工具调用时,它会在每个工具结果之后各执行一次 |
 | `_promote_oldest_steer()`(`harness.py:501`) | 调度器完全空闲 | 见第 4.3 节 |
 
-空闲轮次里 `_drain_inbox()` 会开一个空事务、不写任何东西 —— 事务为空也安全,这是"一切经 commit()"纪律的统一代价。
+收件箱为空时,`_drain_inbox()` 仍会开一个事务后立即返回、不写任何东西 —— 空事务也安全,这是"一切经 commit()"纪律的统一代价。注意它不会在调度器"空闲轮次"被主动调用,只在上述两个时机进入。
 
 ## 8. 生命周期与外部接口
 
 | 方法 | 行为 | 对调度器的影响 |
 |---|---|---|
-| `Harness.open(db_file, ...)`(`harness.py:263`) | 打开(或重开)SQLite 文件,构造 Harness 并启动调度线程 | 同一个文件就是同一个会话;open 本身不恢复,恢复靠 `resume()` |
-| `resume()`(`harness.py:274`) | 事务内 `finalize_finished_submissions()`:running 但已无待办任务的 submission 直接补 done(工作与状态同事务落盘,"没活干"即"已做完");然后 `kick()` | 唤醒调度线程立刻接手遗留任务;这是**新进程接管旧现场**的入口 |
+| `Harness.open(db_file, ...)`(`harness.py:263`) | 打开(或重开)SQLite 文件,构造 Harness 并启动调度线程(线程在 `__init__` 里立即 start) | 同一个文件就是同一个会话;线程启动后就会用 `next_submission_needing_work()` 接手"running 且有未完成任务"的现场,不需要先调 `resume()` |
+| `resume()`(`harness.py:274`) | 事务内 `finalize_finished_submissions()`:running 但已无待办任务的 submission 直接补 done(工作与状态同事务落盘,"没活干"即"已做完");然后 `kick()` | 补收"任务都 done、submission 还是 running"的收尾。对"仍有未完成任务"的现场,`open()` 后调度线程本来就会接手;`resume()` 只是再 kick 一次 |
 | `kick()`(`harness.py:293`) | `_wake.notify_all()` | 叫醒可能睡着的调度线程 |
-| `wait_for_idle(timeout)`(`harness.py:309`) | 忙碌 = `_active` 非空 ∨ 有 open 的 input ∨ 有 open 的 steer ∨ `count_open_tasks_all() > 0`;50ms 轮询 | 四个条件全部来自实体表 + 一个内存量;它是课程脚本"等干完再退出"的依据 |
+| `wait_for_idle(timeout)`(`harness.py:309`) | 忙碌 = `_active` 非空 ∨ 有 open 的 input ∨ 有 open 的 steer ∨ `count_open_tasks_all() > 0`;50ms 轮询 | 后三个条件来自实体表,`_active` 是唯一的内存控制量;它是课程脚本"等干完再退出"的依据 |
 | `close()`(`harness.py:302`) | 置 `_closed` → kick → join(2s) → `storage.close()` | 优雅关停;不 kill 也不回滚 —— 已提交的数据本来就在库里 |
 
-`_active` 为什么也要进 `wait_for_idle` 的判断?因为存在一个事务间隙:最终 generation 的收尾提交(T6 同款)已把任务全部置 done,而 `_finish` 的 done 提交还没落 —— 此刻"库里无未完成任务但 `_active` 非空"。进程若死在这个间隙,重启后由 `resume()` 的 finalize 补上 done;活着时由 `_active` 把这个窗口挡住。
+`_active` 为什么也要进 `wait_for_idle` 的判断?因为存在一个事务间隙:最终 generation 的收尾提交(T4' 同款,即 `_run_generation()` 的第二次提交,`harness.py:425-432`)已把任务全部置 done,而 `_finish` 的 done 提交还没落 —— 此刻"库里无未完成任务但 `_active` 非空"。进程若死在这个间隙,重启后由 `resume()` 的 finalize 补上 done;活着时由 `_active` 把这个窗口挡住。
+
+代码依据(`open()` 启动线程;`resume()` 只做 finalize + kick):
+
+```python
+# harness.py:259-260
+self._thread = threading.Thread(target=self._loop, daemon=True, name="pi-scheduler")
+self._thread.start()
+
+# harness.py:282-284
+with self.storage.commit() as st:
+    st.finalize_finished_submissions()
+self.kick()
+```
 
 ## 9. 崩溃点逐个分析:每个位置死掉会发生什么
 
 这是理解调度器设计的试金石。以第 2/3 课的输入(带 request_id,一次 bash 调用,事务编号对应 [storage-entities.md](storage-entities.md) 第 3 节 T1–T8)为例:
 
-| 死亡位置 | 已提交的现场 | 重启 `resume()` 后 |
+| 死亡位置 | 已提交的现场 | 重启后(`open()` 启动调度线程;`resume()` 补收尾) |
 |---|---|---|
 | T1 之前 | 无任何痕迹 | 仿佛输入从未递交 |
 | T1(`submit`)之后 | submission open;`pi.user` 条目已落;request_id 已注册 | `next_submission_needing_work` 找到 open input,正常接手;重试同 request_id 也不会重复受理 |
 | T2(领取)之后 | submission running;`pi.generation` pending | `fresh=False`,不重复派活;直接执行该任务 |
-| T3(模型检查点)之后、模型调用中 | 任务 running + checkpoint=calling-model | generation **重跑**(无副作用);`_ensure_system_entry` 幂等,系统段不重复 |
+| T3(模型检查点)之后、模型调用中 | 任务 running + checkpoint=calling-model;若已过 T3b,`pi.system` / `pi.system-state` 也已落盘 | generation **重跑**(无副作用);`_ensure_system_entry` 幂等,系统段不重复 |
 | 模型返回后、T4 落盘前 | 同上 | 同上 —— 丢了的那次回复重跑一次即可 |
-| T4(回复落盘)之后 | `pi.assistant` 已落;n 个 `pi.tool` pending | 从第一个 tool 继续;模型上下文由 entries 全量重放,与崩溃前一致 |
+| T4(回复落盘)之后 | `pi.assistant` 已落;n 个 `pi.tool` pending | 从第一个 tool 继续;全部 tool 完成后,按插入顺序执行 n 个 generation(见第 5 节);模型上下文由 entries 全量重放,与崩溃前一致 |
 | T5(工具检查点)之后、bash 执行中 | 任务 running + checkpoint=executing | **interrupted 分支**:不重跑 bash,写入 interrupted 结果,模型自行决策 |
 | bash 执行完、T6 落盘前 | 同上 | 同上(结果丢了就按"可能跑了一半"处理) |
 | T6(结果落盘)之后 | `pi.tool-result` 已落;下一轮 generation pending | 继续生成,模型看到完整结果 |
@@ -223,6 +249,8 @@ _drain_inbox()        ← 工具轮次结束,运行途中到达的 steer 此时�
 4. **无跨进程锁**:`storage.py` 只保证进程内串行(RLock + WAL);同一时刻一个库文件只归一个进程打开(示例脚本都是先杀旧进程再开新的)。两个进程同时 open 同一文件不在支持范围内。
 5. **无优先级/并发调度**:submission 严格按 id 先来先服务,任务严格按 id 顺序执行;没有抢占、没有并行。
 6. **轮询节奏是拍脑袋的演示值**:调度兜底 0.2s、idle 判断 50ms、事件流 100ms,统一"够用就好"。
+7. **系统提示词只记录、不注入**:`_ensure_system_entry()` 维护 `pi.system` 占位条目和 `pi.system-state` 文档,但 `_messages()` 不构造 system 消息,模型请求里没有系统提示词。提示词缓存语义在当前 Python 版不会实际生效(见 `harness.py:523-540` 的 docstring)。
+8. **一批 n 个工具会触发 n 次后续生成**:`_run_tool()`(`harness.py:476-477`)每完成一个工具就插一个 `pi.generation`,而任务按 id 顺序执行(`storage.py:204-208`),所以 n 个工具全部跑完后,这 n 个 generation 才依次执行。n>1 时模型会被多调 n-1 次,并产生额外的 assistant 条目;课程示例只用 1 个工具调用,因此没有暴露。若要做到"整批工具只生成一次",需要在最后一个工具收尾时才插 generation,或给 generation 更小的排序键 —— 当前代码没有这样做。
 
 ## 11. 一图总结调度器的世界观
 
@@ -247,7 +275,7 @@ _drain_inbox()        ← 工具轮次结束,运行途中到达的 steer 此时�
 
 ### A1 主线:一次"生成 → 工具 → 生成"的完整运行
 
-事务编号 T1–T8 对应 [storage-entities.md](storage-entities.md) 第 3 节(该节顶部附有这组事务的渲染时序图 `transaction-timeline.png`,可先看图再读下面的细粒度版本);两个灰色注记"不在任何事务里"的就是仅有的两处外部动作。崩溃分支(死在两个外部动作处会发生什么)见 [python/README.md](../README.md) 的崩溃-续跑时序图。
+事务编号 T1–T8 对应 [storage-entities.md](storage-entities.md) 第 3 节(该节顶部附有这组事务的渲染时序图 `transaction-timeline.png`,可先看图再读下面的细粒度版本;该图未单独画出 T3b,T3b 只在首次运行或提示词/工具列表变化时出现);两个灰色注记"不在任何事务里"的就是仅有的两处外部动作。崩溃分支(死在两个外部动作处会发生什么)见 [python/README.md](../README.md) 的崩溃-续跑时序图。
 
 ```mermaid
 sequenceDiagram
@@ -272,15 +300,16 @@ sequenceDiagram
 
     loop 直到某轮回复不再要求调工具
         W->>S: T3:generation →running + checkpoint=calling-model + turn_start
+        Note over W: 首次运行或提示词/工具列表变化时,<br/>_ensure_system_entry() 再提交一次 T3b(不发事件)
         W->>M: generate(_messages(), specs) —— 不在任何事务里
         M-->>W: 回复(文本块 + 可选 toolCall 块)
         alt 回复带工具调用
             W->>S: T4:pi.assistant 落库 + 插入 n 个 pi.tool(pending) + generation→done + message_update
             W->>S: T5:tool →running + checkpoint=executing + tool_execution_update
-            W->>B: run(arguments) —— 不在任何事务里
+            W->>B: tool.run(call.get("arguments", {})) —— 不在任何事务里
             B-->>W: 结果文本
             W->>S: T6:pi.tool-result 落库(toolCallId 配对) + tool→done + 插入下一轮 pi.generation + tool_result
-            W->>S: _drain_inbox():把等待中的 steer 并入(无则空事务)
+            W->>S: _drain_inbox():每个 tool 收尾后都尝试一次(无则空事务)
         else 无工具调用(最终回答)
             W->>S: T4':pi.assistant 落库 + generation→done(无新任务) + message_update
         end
@@ -297,6 +326,7 @@ sequenceDiagram
 读图要点:
 
 - **循环体 = 一次 generation 任务**(一个 `_step`)。回复里带工具调用时,T4 先把工具调用记成 `pi.tool` 任务,接下来的 `_step` 们依次执行 T5→bash→T6,再插回新的 generation,进入下一圈;
+- 图按"一次回复只带 1 个工具调用"绘制。若一次回复带 n 个调用,每个 tool 收尾都会插一个 generation;由于 id 顺序,实际是 n 个 tool 先跑完,再依次跑 n 个 generation(见第 5 节和第 10 节第 8 条);
 - **事件与状态同事务**:图上每个 T 里的事件(如 T5 的 `tool_execution_update`)和检查点一起 COMMIT,所以观察者收到事件时,对应事实必已可读;
 - **脚本的 wait/轮询只读库**:等待者与调度器之间没有任何直接通信,通信介质就是 SQLite 本身。
 
@@ -382,19 +412,19 @@ def _run_tool(self, sid: int, task: Dict[str, Any]) -> None:
 
 | # | 逐行解释 |
 |---|---|
-| ① | `sid` 是挂靠的 submission id(只用于发事件);`task` 是 `_advance` 从 `next_open_task()` 取回的完整任务行。此刻 `task["status"]` 只可能是 `pending` 或 `running` —— done 的已被查询过滤 |
+| ① | `sid` 是挂靠的 submission id(用于发事件,也用于 `insert_task("pi.generation", sid, ...)` 创建下一轮任务,见 `harness.py:477`);`task` 是 `_advance` 从 `next_open_task()` 取回的完整任务行。此刻 `task["status"]` 只可能是 `pending` 或 `running` —— done 的已被查询过滤 |
 | ② | 从 payload 拆出工具调用三要素。payload 是 T4 事务里从 assistant 条目的 `toolCall` 块**原样拷贝**的,所以这里的 name/arguments/id 与模型看到的一致 |
 | ③ | 从工具注册表找实现;名字不存在时返回 `None`。注意 `tool` 可能是 None,后续所有分支都要能处理这种情况 |
-| ④ | `toolCallId`:收尾提交时写进 tool-result 条目,与 assistant 条目里的调用块**配对** —— 模型下一轮就靠这组 id 对上"我的调用"和"它的结果" |
-| ⑤ | **恢复逻辑的全部判据**。前半个条件:`status == "running"` 只可能来自上个进程 —— 活着的进程会把任务一口气从 pending 推到 done,绝不会带着 running 状态回到调度器(第 4 节讲过 status 只进不退)。后半个条件:工具不可重放(有副作用)才走 interrupted,**未知工具名按最保守处理**。生成的提示文本本身是一条合法的 tool-result:模型读得懂,由它决定重试、绕开还是询问用户 |
+| ④ | `toolCallId`:收尾提交时写进 tool-result 条目,与 assistant 条目里的调用块**配对** —— 使用 OpenRouter 等真实模型时,下一轮就靠这组 id 对上"我的调用"和"它的结果"。faux 假模型生成的调用 `id` 为 `None`(`models.py:85`),它只按"上一条是 toolResult"决定回复(`models.py:72-74`),不依赖配对 |
+| ⑤ | **恢复逻辑的全部判据**。前半个条件:`status == "running"` 通常来自上个进程 —— 活着的进程正常会把任务从 pending 推到 done,不会带着 running 状态回到调度器(第 4 节讲过 status 只进不退)。唯一的例外是任务执行抛异常:`_loop` 把 submission 置 `failed`,任务留在 running/pending,但该 submission 不会再被 `next_submission_needing_work()` 选中。后半个条件:工具不可重放(有副作用)才走 interrupted,**未知工具名按最保守处理**。生成的提示文本本身是一条合法的 tool-result:模型读得懂,由它决定重试、绕开还是询问用户 |
 | ⑥ | `pending`(从没跑过)或 `replay == "safe"`(重放无害,如读文件)→ 照常执行 |
 | ⑦ | **崩溃安全的关键一笔**:先提交"正要执行"这个事实,再动手。此后进程任何时刻死掉,重启后任务都是 running,⑤ 据此分辨"没跑过"和"跑了一半"。事件与检查点同事务:观察者收到 `tool_execution_update` 时,检查点必已落盘 |
 | ⑧ | 工具不存在也不抛错 —— 照样给模型一个可读的结果,让它自行处置 |
 | ⑨ | 全函数唯一的"外部世界"动作,bash 跑多久都可能。死在这一行 = 第 2 课 `02_crash.py` 的场景 |
 | ⑩ | 工具异常不炸调度器:异常文本当作结果交给模型 —— 错误也是"结果",模型自治 |
-| ⑪ | **无论走⑤还是⑥,收尾都走同一事务**:结果落库 + 任务置 done + 派生下一轮 + 发事件,四笔原子提交。interrupted 分支也照常 —— 这保证流水线不被堵死(如果 interrupted 后不置 done、不插任务,submission 会永远卡住) |
-| ⑫ | 插入下一轮 `pi.generation` 是**流水线的动力**:模型读到结果后继续作答;直到某轮回复不再要求调工具,那次 generation 的收尾提交就不会再插任务,队列自然清空,`_finish` 接手 |
-| ⑬ | 工具轮次结束是并入 steer 的安全点(附 A2 情形 1):模型下一轮重放上下文时自然看到并入的内容 |
+| ⑪ | **无论走⑤还是⑥,收尾都走同一事务**:结果落库 + 任务置 done + 派生下一轮 + 发事件,四笔写入在同一个事务里。interrupted 分支也照常 —— 这保证流水线不被堵死(如果 interrupted 后不置 done、不插任务,submission 会永远卡住) |
+| ⑫ | 插入下一轮 `pi.generation` 是**流水线的动力**:模型读到结果后继续作答;某次 generation 若不再要求调工具,它就不会再插任务。注意一批 n 个工具会插 n 个 generation,它们都要执行完(且都不再插任务)队列才清空,`_finish` 才接手(见第 5 节、第 10 节第 8 条) |
+| ⑬ | **每个** `pi.tool` 任务收尾后都是并入 steer 的安全点(附 A2 情形 1),不是等整批工具全部结束。模型下一轮重放上下文时自然看到并入的内容 |
 
 一句话总结这段代码的纪律:**先记账(⑦)、再干活(⑨)、后收账(⑪);记账和收账之间死掉不可怕,重启后⑤靠着库里的 status 分辨一切。**
 
