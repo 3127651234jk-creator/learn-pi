@@ -9,7 +9,7 @@
     "resume": "tsx src/03-resume.ts",
     "twice": "tsx src/04-idempotent.ts",
     "watch": "tsx src/05-watch.ts",
-    "clean": "rm -rf .data"
+    "clean": "node -e \"require('fs').rmSync('.data',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.3",

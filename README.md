@@ -9,6 +9,26 @@
 - `npm run twice`   把同一个 requestId 发送两次,得到同一个 submission
 - `npm run watch`   在 steer 加入运行时,流式观察事件
 
+## 两个版本:TypeScript 与 Python
+
+同一套五节课有两个平行实现,注释一一对应,便于对照阅读:
+
+| | TypeScript 版(本 README 讲的) | Python 版 |
+|---|---|---|
+| 位置 | `src/*.ts` | `python/examples/*.py` |
+| 底层库 | npm 包 `@earendil-works/pi-durable` 1.0.3 | 自带迷你 `pidurable` 包(约 500 行纯标准库) |
+| 依赖 | `npm install` | 无任何第三方依赖 |
+| 运行 | `npm run hello` 等 | `cd python/examples && python 01_hello.py` 等 |
+
+两版共用同一份 `.env` 和 `.data/agent.sqlite`。
+API 层面的 TS → Python 对应表见 [`python/README.md`](python/README.md)。
+
+### Windows 上的两个注意点(`src/setup.ts` 已处理)
+
+- `URL.pathname` 在 Windows 上会得到 `/D:/...` 这样的路径,必须经 `fileURLToPath` 转换;
+- bash 工具默认只找 `%ProgramFiles%\Git` 和 PATH 里的 bash,找不到会报 `No bash shell found`。
+  `setup.ts` 会通过 `where git` 自动推出 `<Git 安装根>\bin\bash.exe`,也可用环境变量 `GIT_BASH` 显式指定。
+
 ## 时序图:一次运行如何度过崩溃
 
 第 2、3 课(Node 版与 Python 版行为一致)发生的事情,按时间顺序。

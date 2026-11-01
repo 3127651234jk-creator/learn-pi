@@ -1,4 +1,4 @@
-// Lesson 4: the same requestId is admitted once. A retry (or a restart) finds the same submission.
+// 第 4 课:同一个 requestId 只受理一次。重试(或重启)找到的是同一个 submission。
 import { ctx, openAgent } from "./setup.ts";
 
 const { harness, root } = await openAgent();

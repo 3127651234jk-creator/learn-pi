@@ -1,5 +1,5 @@
-// Lesson 1: one question, one answer, and it is on disk.
-// Run it twice. The second run shows the first run's entries too, because the SQLite file is the conversation.
+// 第 1 课:一问一答,并且已经落盘。
+// 运行两次:第二次也会打印第一次的条目,因为 SQLite 文件就是会话本身。
 import { ctx, DB_FILE, openAgent, printTranscript } from "./setup.ts";
 
 const { harness, root } = await openAgent();
