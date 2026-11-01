@@ -26,15 +26,29 @@ CREATE TABLE IF NOT EXISTS tasks (
 | `id` | INTEGER | PK, AUTOINCREMENT | 任务编号;同一 submission 内按 id 顺序执行 |
 | `type` | TEXT | NOT NULL | `pi.generation`(调一次模型)或 `pi.tool`(执行一次工具调用) |
 | `status` | TEXT | NOT NULL | `pending → running → done`,**只进不退** |
-| `submission_id` | INTEGER | NOT NULL | 挂靠的 submission —— 五张表之间唯一的显式外键关系 |
+| `submission_id` | INTEGER | NOT NULL | 挂靠的 submission —— 五张表之间唯一的逻辑外键式关联。注意 SCHEMA 未声明 `FOREIGN KEY` 约束,它只是普通整数列 |
 | `payload` | TEXT | NOT NULL | JSON,任务参数,结构随 type 而定,见下节 |
 | `checkpoint` | TEXT | 可空 | 阶段检查点 JSON:`{"phase": "calling-model"}` 或 `{"phase": "executing"}` |
 
 `status` 只进不退,意味着重启后读到的每种状态都有明确含义:
 
 - `pending`:还没轮到它;
-- `running`:**上一个进程死在半路**(活着的进程会把它推到 done);
+- `running`:**通常是上一个进程死在半路**(活着的进程正常会把任务推到 done);若任务执行抛异常,`_loop` 会把 submission 置 `failed`,任务可能留在 `running`/`pending`,但不会再被调度(见 [scheduler.md](../scheduler.md) 第 3、10 节);
 - `done`:已彻底完成。
+
+代码依据(建表语句里没有 `FOREIGN KEY`):
+
+```sql
+-- storage.py:38-45
+CREATE TABLE IF NOT EXISTS tasks (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  type          TEXT NOT NULL,
+  status        TEXT NOT NULL,
+  submission_id INTEGER NOT NULL,
+  payload       TEXT NOT NULL,
+  checkpoint    TEXT
+);
+```
 
 ## 3. `type` 与 `payload` 的对应
 
@@ -48,26 +62,52 @@ CREATE TABLE IF NOT EXISTS tasks (
 一次 input 的推进被切成一串任务,顺序执行:
 
 ```
-pi.generation  →  pi.tool × n  →  pi.generation  →  ...  →  (不再调工具)
+pi.generation  →  pi.tool × n  →  pi.generation × n  →  ...  →  (不再调工具)
 ```
 
 规则(`harness.py` 文件头与 `_run_generation` / `_run_tool`):
 
 1. 每个 `pi.generation` 完成时,若模型回答里带了工具调用,就为每个调用插一个 `pi.tool` 任务(先记账,后执行);
 2. 每个 `pi.tool` 完成时(结果已落库),插一个新的 `pi.generation` 任务,让模型带着结果继续作答;
-3. 如此循环,直到某次回复不再要求调工具 —— 队列空了,submission 收尾宣告 done。
+3. 如此循环,直到所有已排队的 generation 都执行完,且没有新的工具调用 —— 队列空了,submission 收尾宣告 done。
+
+注意第二个 `× n`:一批 n 个工具会各自插一个 `pi.generation`。`next_open_task()` 按 id 取最早的未完成任务,而 T4 里插入的其余工具任务 id 更小,所以实际顺序是"先跑完 n 个 tool,再依次跑这 n 个 generation"。n=1(课程示例)时这就是"工具结果后接一次生成";n>1 时模型会被多调 n-1 次,第一次之后的 generation 看到的是上一条 assistant 回复。这是当前实现的真实行为,不是文档笔误。
+
+代码依据:
+
+```python
+# harness.py:476-477
+st.update_task(task["id"], status="done")
+st.insert_task("pi.generation", sid, {"submissionId": sid})  # 每个 tool 收尾都插一个
+```
+
+```python
+# storage.py:204-208
+row = self._conn.execute(
+    "SELECT id, type, status, payload, checkpoint FROM tasks "
+    "WHERE submission_id = ? AND status != 'done' ORDER BY id LIMIT 1",
+    (submission_id,),
+).fetchone()
+```
 
 ## 5. 检查点(checkpoint):崩溃安全的关键一笔
 
 `checkpoint` 记录"正要做什么"这个事实,**在真正执行外部动作之前先提交**。以工具执行为例(`_run_tool()`,节选):
 
 ```python
+# harness.py:457-466
 with self.storage.commit() as st:
     st.update_task(task["id"], status="running", checkpoint={"phase": "executing"})
-    st.emit("tool_execution_update", ...)
-# ↑ 这笔提交落盘后才开始跑 bash
-#   若进程死在下面这一行,重启后任务仍是 running → 走 interrupted 分支
-result_text = tool.run(arguments)
+    st.emit("tool_execution_update", {"submissionId": sid, "tool": name})
+# ↑ 这笔提交落盘后才开始跑工具
+#   若进程死在这里,重启后任务仍是 running → 走 interrupted 分支
+try:
+    if tool is None:
+        result_text = "[unknown tool {}]".format(name)
+    else:
+        result_text = tool.run(call.get("arguments", {}))
+except Exception as exc:
+    result_text = "[error] {}".format(exc)
 ```
 
 调模型前同理,先提交 `{"phase": "calling-model"}`。而模型调用、bash 执行这些"外部世界"动作**不在任何事务里** —— 它们无法回滚,所以绝不会放进事务;崩溃后能恢复的全部信息,都来自检查点提交前后的表状态。
@@ -119,9 +159,13 @@ result_text = tool.run(arguments)
 | T4 `_run_generation()` 后 | 插入 n 个 `pi.tool`(pending),generation → done |
 | T5 `_run_tool()` 前 | 该 tool → running,checkpoint=executing |
 | — 工具执行 | **不在事务里**;死在这里就是第 2 课的场景 |
-| T6 `_run_tool()` 后 | tool → done,插入下一轮 `pi.generation` |
+| T6 `_run_tool()` 后 | tool → done,插入下一轮 `pi.generation`(每个 tool 任务各插一个) |
 
 注意 T4 和 T6 的关键设计:**"结果落库 + 任务标记 done + 派生下一批任务"在同一个事务里**,三个事实要么同时存在,要么都不存在。
+
+> `_run_tool()` 在 T6 之后还会调用 `_drain_inbox()`;它不改变 tasks 表,只消费 steer。有 n 个工具调用时,这一步在每个工具收尾后都会发生,所以 steer 可能在下一个工具结果之前就进入对话。
+>
+> 同理,一批 n 个工具会产生 n 个 `pi.generation` 任务;它们 id 更大,会等所有 tool 跑完后依次执行(见第 4 节)。
 
 ## 9. 设计动机
 

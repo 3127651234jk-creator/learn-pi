@@ -2,7 +2,7 @@
 
 > 五张实体表之一。本文只讲这一张表;全局视角见 [../storage-entities.md](../storage-entities.md)。
 
-一句话定位:**用户每递交一次输入就多一行,它记录"这次输入的受理与推进状态"。调度器的一切判断都围绕它;`request_id` 的 UNIQUE 约束是幂等性的根基。**
+一句话定位:**用户每递交一次输入就多一行,它记录"这次输入的受理与推进状态"。调度器的一切判断都围绕它;幂等由"受理前按 `request_id` 查重"实现,`request_id` 的 UNIQUE 约束是最后防线。**
 
 ## 1. 建表语句
 
@@ -67,6 +67,22 @@ CREATE TABLE IF NOT EXISTS submissions (
 
 重试者拿到的是**同一个 submission 句柄**,没有第二条记录被创建。这套机制让"客户端超时重试"变成无害操作 —— 第 4 课专门演示这一点。
 
+代码依据(普通输入路径,`harness.py:142-150`,节选):
+
+```python
+with harness.storage.commit() as st:
+    if request_id:
+        # harness 对每个 requestId 只受理一次:重试找到的是同一个 submission
+        existing = st.find_submission_id_by_request(request_id)
+        if existing:
+            return Submission(harness, existing)
+    sid = st.insert_submission("input", request_id)
+    st.append_entry("pi.user", content)
+    st.emit("submission_created", {"submissionId": sid})
+```
+
+注意:真正拦住重复受理的是**插入前的查询**;`request_id` 的 `UNIQUE` 约束是兜底。当前实现没有依赖"撞唯一约束再回滚"。steer 路径在 `harness.py:125-139` 用同样的先查后插逻辑。
+
 ## 6. 谁写、谁读
 
 | 方向 | 代码 | 说明 |
@@ -98,7 +114,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 - 不知道一次输入做到哪一步 —— 排队、进行中、完成、失败全无痕迹;
 - 跨进程等待("另一个进程里等这个输入跑完")无从谈起。
 
-它和 tasks 的分工:**submissions 回答"用户要了什么、推进到哪个阶段",tasks 回答"为了做到这件事,还剩哪些具体小步"**。tasks 通过 `submission_id` 挂靠到 submissions,是五张表之间唯一的显式外键关系。
+它和 tasks 的分工:**submissions 回答"用户要了什么、推进到哪个阶段",tasks 回答"为了做到这件事,还剩哪些具体小步"**。tasks 通过 `submission_id` 挂靠到 submissions,是五张表之间唯一的逻辑外键式关联。注意 SCHEMA 并未声明 `FOREIGN KEY` 约束,`submission_id` 只是 `INTEGER NOT NULL` 列(见 [tasks.md](tasks.md) 的建表语句)。
 
 ## 9. 与 TS 原版对应
 

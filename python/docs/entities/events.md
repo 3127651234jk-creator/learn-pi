@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 一个简化之处:`_loop()` 的异常分支把 submission 置为 `failed` 时**不发事件** —— 等待者通过轮询 status 才能观察到失败,这是迷你实现留的口子。
 
+另外,`_ensure_system_entry()`(T3b,`harness.py:536-540`)和 `_promote_oldest_steer()`(`harness.py:509-518`)的写入也**不发事件**;`_drain_inbox()`(`harness.py:495-499`)把 steer 标记 done 时同样不发。当前事件表只覆盖上表的 8 种,这些状态变化只能通过 entries / documents 或轮询 submission 状态观察。
+
 ## 4. 观察协议:快照 + 增量
 
 `EventStream`(`harness.py:164`)实现了"UI 只是观察者"的思想:
@@ -56,13 +58,13 @@ CREATE TABLE IF NOT EXISTS events (
 
 | 方向 | 代码 | 说明 |
 |---|---|---|
-| 写 | `emit(type, payload)`(`storage.py:227`) | 唯一写入口;**总是与对应的状态变更在同一个事务里**,所以"状态变了但事件没发"不可能发生 |
+| 写 | `emit(type, payload)`(`storage.py:227`) | 唯一写入口;**对上表 8 种事件而言,emit 与对应的状态变更在同一个事务里**,所以"事件可见时状态还没落盘"不可能发生。反过来不成立:并非所有状态变更都发事件 —— `failed`、`_drain_inbox()`、`_promote_oldest_steer()`、`_ensure_system_entry()` 都没有事件(见第 3 节) |
 | 读(游标基准) | `last_event_id()`(`storage.py:233`) | 当前最大事件 id |
 | 读(增量) | `events_since(last_id)`(`storage.py:237`) | 取 id 大于游标的所有事件,按序返回 |
 
 ## 6. 在事务时间线中的位置
 
-每个事务里,事件和它描述的状态变更一起 COMMIT:
+对下表这些带事件的事务,事件和它描述的状态变更一起 COMMIT:
 
 | 事务 | 同事务发出的事件 |
 |---|---|

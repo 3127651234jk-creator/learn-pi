@@ -1,6 +1,6 @@
 # 一次存储涉及哪些实体 —— Python 版持久化详解
 
-本文对应 `python/pidurable/` 迷你库(约 500 行),回答一个问题:
+本文对应 `python/pidurable/` 迷你库(当前代码共 1133 行:`harness.py` 564、`storage.py` 244、`tools.py` 106、`models.py` 192、`__init__.py` 27),回答一个问题:
 **python 版的一次"存储"到底碰了哪些实体信息?**
 
 先说结论:
@@ -12,7 +12,7 @@
 
 ![pi-durable Python 版的四层架构图:接入观察层、Harness 编排层、外部执行层与 SQLite 持久化层](mermaid-diagram.png)
 
-上面这张图从**分层视角**看同一次存储:①接入与观察层(`resume()` / 用户 `submit` / `watch_events`)通过 ②Harness 编排层(Scheduler、Generation/Tool 任务、检查点)落到 ④SQLite 持久层 —— 所有写入都经 `Storage.commit()` 进入 `agent.sqlite`,再分发给五张实体表;而 ③外部执行层(模型调用、bash 工具)**不在任何事务里**,崩溃恢复的信息全部来自持久层的表。下面的 ER 图则聚焦实体本身的字段与关系:
+上面这张图从**分层视角**看同一次存储:①接入与观察层(`resume()` / 用户 `submit` / `watch_events`)通过 ②Harness 编排层(Scheduler、Generation/Tool 任务、检查点)落到 ④SQLite 持久层 —— 所有业务写入都经 `Storage.commit()` 进入 `agent.sqlite`,再分发给五张实体表;而 ③外部执行层(模型调用、bash 工具)**不在任何事务里**,崩溃恢复的信息全部来自持久层的表。下面的 ER 图则聚焦实体本身的字段与关系:
 
 ```mermaid
 erDiagram
@@ -50,6 +50,20 @@ erDiagram
     }
 ```
 
+> 说明:ER 图里的 `submissions ||--o{ tasks` 只表达**逻辑挂靠**。实际 `SCHEMA` 中 `tasks.submission_id` 是普通 `INTEGER NOT NULL` 列,没有声明 `FOREIGN KEY` 约束(代码依据):
+>
+> ```sql
+> -- storage.py:38-45
+> CREATE TABLE IF NOT EXISTS tasks (
+>   id            INTEGER PRIMARY KEY AUTOINCREMENT,
+>   type          TEXT NOT NULL,
+>   status        TEXT NOT NULL,
+>   submission_id INTEGER NOT NULL,
+>   payload       TEXT NOT NULL,
+>   checkpoint    TEXT
+> );
+> ```
+
 ---
 
 ## 1. 什么算"一次存储"
@@ -68,7 +82,7 @@ with storage.commit() as st:
 
 1. **每一步先原子提交,再展示给任何人** —— 进程因此是可丢弃的。
 2. **每个任务在每个阶段保存检查点** —— 重启后从最后一个检查点继续。
-3. **每个 `requestId` 只受理一次** —— 靠 `submissions.request_id` 的 UNIQUE 约束。
+3. **每个 `requestId` 只受理一次** —— 受理前先 `find_submission_id_by_request()` 查重(`harness.py:126-130`、`harness.py:143-147`);`submissions.request_id` 的 UNIQUE 约束(`storage.py:33`)是兜底。
 
 ### 存储层怎么保证原子性
 
@@ -119,7 +133,24 @@ python/.data/
 | `pi.tool-result` | `_run_tool()` 第二段 | `[{"type": "text", "text": 结果文本, "toolCallId": 调用 id}]`;崩溃恢复时写的是 `interrupted` 提示文本 |
 | `pi.system` | `_ensure_system_entry()` | **恒为空字符串 `""`**。系统提示词本体不在这里,在 `documents` 的 `pi.system-state` 里;这条空条目只负责"对话历史中此处有一条系统段"的占位 |
 
-组装模型消息时(`harness._messages()`),只有 `pi.user` / `pi.assistant` / `pi.tool-result` 三种会进消息列表;`pi.system` 被跳过,提示词由 `pi.system-state` 文档单独维护。
+组装模型消息时(`harness._messages()`),只有 `pi.user` / `pi.assistant` / `pi.tool-result` 三种会进消息列表;`pi.system` 被跳过。
+
+**注意:当前 Python 实现没有把 `pi.system-state` 里的提示词拼进模型请求。** `_ensure_system_entry()` 的 docstring 写得很明确:"本迷你版只把系统提示词记录在案,并未拼进真正的模型请求(假模型用不上;真实模型层也未使用它 —— 见 models.py)"。`_messages()` 也不构造 system 消息,所以模型实际收到的只有下面三种角色:
+
+```python
+# harness.py:542-564(节选)
+for entry in self.storage.list_entries():
+    kind = entry["kind"]
+    if kind == "pi.user":
+        msgs.append({"role": "user", "content": entry["content"]})
+    elif kind == "pi.assistant":
+        msgs.append({"role": "assistant", "content": entry["content"]})
+    elif kind == "pi.tool-result":
+        msgs.append({"role": "toolResult", "content": entry["content"]})
+    # pi.system 不进消息列表:系统提示词由 pi.system-state 文档维护
+```
+
+(最后一行是源码里的原注释,指的是"去重基准"存放在文档里;它不表示文档内容被发送给了模型。)
 
 ### 2.2 `documents` —— 少量键值状态
 
@@ -133,7 +164,23 @@ python/.data/
 | key | 值的结构 | 谁写 / 谁读 |
 |---|---|---|
 | `inbox` | `[{"submissionId": 3, "content": ...}, ...]` | `submit(when_busy="steer")` 追加;`_drain_inbox()` / `_promote_oldest_steer()` 弹出。steer(忙碌时引导)的暂存收件箱 |
-| `pi.system-state` | `{"system": SYSTEM_PROMPT, "tools": ["bash"]}` | `_ensure_system_entry()` 写;用它做**去重**:状态没变就不追加新的 `pi.system` 条目,保持提供商的提示词缓存命中 |
+| `pi.system-state` | `{"system": SYSTEM_PROMPT, "tools": ["bash"]}` | `_ensure_system_entry()` 写;用它做**去重**:状态没变就不追加新的 `pi.system` 条目。注意本迷你版只记录状态,不把提示词注入模型请求(见下) |
+
+`_ensure_system_entry()` 的真实行为(代码依据):
+
+```python
+# harness.py:533-540(函数体;函数定义见 harness.py:523)
+state = {"system": SYSTEM_PROMPT, "tools": self.registry.names()}
+if self.storage.get_doc("pi.system-state") == state:
+    return
+with self.storage.commit() as st:
+    if st.get_doc("pi.system-state") == state:  # 事务内复查,防止并发重复写
+        return
+    st.append_entry("pi.system", "")  # 条目做记录;具体内容由 state 文档承载
+    st.set_doc("pi.system-state", state)
+```
+
+它的 docstring 同时说明:"本迷你版只把系统提示词记录在案,并未拼进真正的模型请求(假模型用不上;真实模型层也未使用它 —— 见 models.py)"。所以"保持提供商提示词缓存命中"是这套结构**想表达的语义**,当前 Python 实现并不会真的发送 system 消息,也就谈不上实际命中。
 
 ### 2.3 `submissions` —— 一次输入的受理记录
 
@@ -169,7 +216,7 @@ python/.data/
 |---|---|---|
 | `id` | INTEGER PK AUTOINCREMENT | |
 | `type` | TEXT NOT NULL | `pi.generation`(调模型)或 `pi.tool`(执行工具) |
-| `status` | TEXT NOT NULL | `pending → running → done`;**只进不退**,重启后读到 `running` 就是"上一个进程死在半路" |
+| `status` | TEXT NOT NULL | `pending → running → done`;**只进不退**,重启后读到 `running` 通常就是"上一个进程死在半路"。任务执行抛异常时 submission 会被 `_loop` 置 `failed`,其任务可能留在 `running`/`pending`,但不会再被调度(见 [scheduler.md](scheduler.md) 第 3、10 节) |
 | `submission_id` | INTEGER NOT NULL | 挂靠的 submission |
 | `payload` | TEXT NOT NULL | JSON:`pi.generation` 是 `{"submissionId": n}`;`pi.tool` 是 `{"toolCall": {"name": ..., "arguments": ..., "id": ...}}` |
 | `checkpoint` | TEXT(可空) | JSON 阶段检查点:`{"phase": "calling-model"}`(调模型前)或 `{"phase": "executing"}`(执行工具前) |
@@ -177,12 +224,19 @@ python/.data/
 检查点是崩溃安全的关键一笔。`_run_tool()` 在真正执行工具**之前**先提交:
 
 ```python
+# harness.py:457-466
 with self.storage.commit() as st:
     st.update_task(task["id"], status="running", checkpoint={"phase": "executing"})
-    st.emit("tool_execution_update", ...)
-# ↑ 这笔提交落盘后才开始跑 bash
-#   若进程死在下面这一行,重启后任务仍是 running → 走 interrupted 分支
-result_text = tool.run(arguments)
+    st.emit("tool_execution_update", {"submissionId": sid, "tool": name})
+# ↑ 这笔提交落盘后才开始跑工具
+#   若进程死在这里,重启后任务仍是 running → 走 interrupted 分支
+try:
+    if tool is None:
+        result_text = "[unknown tool {}]".format(name)
+    else:
+        result_text = tool.run(call.get("arguments", {}))
+except Exception as exc:
+    result_text = "[error] {}".format(exc)
 ```
 
 恢复逻辑(`_run_tool()` 开头)据此分辨两种情况:
@@ -228,22 +282,23 @@ result_text = tool.run(arguments)
 
 ![一次完整运行的事务时序图:客户端递交 submit(requestId) 后,Harness 与 SQLite 之间依次发生 T1–T8 原子提交,模型调用与工具执行夹在事务之间](transaction-timeline.png)
 
-(图中省略了 T7 —— 它只在有 steer 并入时发生,见下表第 7 行。)
+(图中省略了 T7 —— 它只在有 steer 并入时发生,见下表第 7 行;图中也未单独画出 T3b —— 它只在首次运行或提示词/工具列表变化时出现。)
 
 | # | 事务(代码位置) | 写入的实体 |
 |---|---|---|
 | T1 | `submit()` | `submissions`:新行(open, request_id=crash-demo-1, mode=input);`entries`:`pi.user`;`events`:`submission_created` |
 | T2 | `_step()` 领取 | `submissions`:open→running;`tasks`:插入 `pi.generation`(pending);`events`:`submission_started` |
-| T3 | `_run_generation()` 前 | `tasks`:该 generation →running, checkpoint=calling-model;`events`:`turn_start`。(首次运行还会多一笔:`entries` 插入空的 `pi.system` + `documents` 写入 `pi.system-state`) |
-| — | 模型调用 | **不在事务里**。死在这里:T2、T3 已提交,重启后任务还是 running,`resume()` 会从头执行这个 generation |
+| T3 | `_run_generation()` 前 | `tasks`:该 generation →running, checkpoint=calling-model;`events`:`turn_start` |
+| T3b | `_ensure_system_entry()`(仅首次运行或提示词/工具列表变化时) | `entries`:插入空的 `pi.system`;`documents`:写入 `pi.system-state`。**这是独立于 T3 的第二次提交**,发生在 T3 之后、模型调用之前;不发事件 |
+| — | 模型调用 | **不在事务里**。死在这里:T2、T3(以及可能的 T3b)已提交,重启后任务还是 running;`open()` 启动的调度线程会从头执行这个 generation(`resume()` 不是执行它的前提) |
 | T4 | `_run_generation()` 后 | `entries`:`pi.assistant`(model 列写入模型引用);`tasks`:插入 n 个 `pi.tool`(pending),generation →done;`events`:`message_update` |
 | T5 | `_run_tool()` 前 | `tasks`:该 tool →running, checkpoint=executing;`events`:`tool_execution_update` |
 | — | 工具执行(bash 跑 4 秒) | **不在事务里**。死在这里:就是第 2 课的场景 |
-| T6 | `_run_tool()` 后 | `entries`:`pi.tool-result`(带 toolCallId);`tasks`:tool →done,插入下一轮 `pi.generation`;`events`:`tool_result` |
-| T7 | `_drain_inbox()`(有 steer 时) | 每弹一条一个事务:`documents`:inbox 弹出;`entries`:`pi.user`;`submissions`:该 steer →done |
+| T6 | `_run_tool()` 后 | `entries`:`pi.tool-result`(带 toolCallId);`tasks`:tool →done,插入下一轮 `pi.generation`(每个 tool 任务各插一个;n>1 时有 n 个 generation 任务);`events`:`tool_result` |
+| T7 | `_drain_inbox()`(有 steer 时) | 每弹一条一个事务:`documents`:inbox 弹出;`entries`:`pi.user`;`submissions`:该 steer →done。调用时机是**每个 `pi.tool` 任务收尾之后**以及 `_finish()` 开头;有 n 个工具调用时,steer 可能在第一个工具结果后就被并入 |
 | T8 | `_finish()` | `submissions`:→done;`events`:`submission_done` |
 
-(空闲轮次里 `_drain_inbox()` 会开一个空事务,不写任何东西。)
+(收件箱为空时,`_drain_inbox()` 仍会开一个事务后立即返回,不写任何东西;它只在 `_run_tool()` 收尾和 `_finish()` 开头被调用,调度器不会在"空闲轮次"主动调用它。表中 T5/T6 按"一次回复只带 1 个工具调用"绘制;若一次回复带 n 个调用,T5/T6 各重复 n 次,T6 还会插入 n 个 `pi.generation`,它们按 id 顺序在所有 tool 之后依次执行。)
 
 ### 崩溃后重启(`03_resume.py`)读什么
 
@@ -251,10 +306,10 @@ result_text = tool.run(arguments)
 harness.resume()   # storage.finalize_finished_submissions() + kick()
 ```
 
-1. **调度器的查询** `next_submission_needing_work()`:找"open 的 input"或"running 且有未完任务"的 submission;
-2. **收尾查询** `finalize_finished_submissions()`:running 但所有任务都 done 的,宣告 done —— 因为工作与状态在同一事务里落盘,"没有待办任务"就等于"这次运行实际上已经做完了";
+1. **调度器的查询** `next_submission_needing_work()`:找"open 的 input"或"running 且有未完任务"的 submission。注意 `open()` 构造 Harness 时调度线程就已启动,会先按这条查询接手遗留任务;`resume()` 不是接手未完成任务的前提;
+2. **收尾查询** `finalize_finished_submissions()`:running 但所有任务都 done 的,宣告 done —— 因为工作与状态在同一事务里落盘,"没有待办任务"就等于"这次运行实际上已经做完了"。这一步由 `resume()` 触发;
 3. **遗留任务**:重启后任务仍是 `running`(比如 T5 之后死的),按第 2.4 节的表格走 interrupted 或重新执行分支;
-4. `wait_for_idle()` 的忙碌判断也全部来自实体:`oldest_open_input()`(open 的 input)、`open_steers()`、`count_open_tasks_all()`。
+4. `wait_for_idle()` 的忙碌判断有三个条件来自实体:`oldest_open_input()`(open 的 input)、`open_steers()`、`count_open_tasks_all()`;第四个是内存量 `self._active`(`harness.py:320-325`)。
 
 ---
 
@@ -265,7 +320,7 @@ harness.resume()   # storage.finalize_finished_submissions() + kick()
 | `entries` | 会话正文,消息 = 按序重放 | 崩溃后模型不知道之前说过什么 |
 | `submissions` | 输入的受理与状态,request_id 幂等 | 重试会重复执行;不知道一次输入做到哪一步 |
 | `tasks` | 把推进切成可恢复的小步 + 检查点 | 崩溃后只能整段重来,或根本无法续跑 |
-| `documents` | 少量键值状态(inbox、system-state) | steer 丢失;系统提示词反复入库、缓存失效 |
+| `documents` | 少量键值状态(inbox、system-state) | steer 丢失;系统提示词状态无处去重,每次生成都可能追加新条目、历史膨胀("缓存命中"语义也无从谈起) |
 | `events` | 观察者订阅已提交状态 | UI 无法在不碰内部状态的前提下跟随进度 |
 
 与 TS 原版(`@earendil-works/pi-durable`)的对应:
@@ -277,12 +332,13 @@ harness.resume()   # storage.finalize_finished_submissions() + kick()
 | `tasks` | tasks 表 |
 | `events` | events 表 |
 | `documents.inbox` | steer 收件箱语义 |
-| `documents.pi.system-state` | 系统提示词去重/缓存命中语义 |
+| `documents.pi.system-state` | 系统提示词去重语义(当前实现只记录、不注入模型请求) |
 
 ### 没有被持久化的东西
 
 - `model_ref`(provider/modelId):打开 harness 时由 `common.py` 传入,只在内存里;持久化痕迹是每条 `pi.assistant` 条目的 `model` 列。
 - 工具注册表 `ToolRegistry`:运行时安装(`registry.install(BASH)`);留痕是 `pi.system-state` 文档里的工具名列表。
+- **系统提示词的实际注入**:提示词被记录在 `pi.system-state`,但 `_messages()` 不构造 system 消息,模型请求里没有它(见 2.1、2.2 的代码依据)。
 - 进程内的调度状态(`self._active`、唤醒条件变量):全部可以从五张表重建,所以进程随时可死。
 
 ---
